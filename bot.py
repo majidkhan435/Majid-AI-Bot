@@ -25,7 +25,7 @@ client = Client(api_key, api_secret)
 
 stop_loss_multiplier = 1.5
 take_profit_multiplier = 2.5
-confidence_threshold = 0.3  # lowered to allow more trades
+confidence_threshold = 0.4  # lowered to allow more trades
 total_portfolio = 100.0
 max_hold_period = 5
 latest_trades = []
@@ -398,4 +398,4 @@ TEMPLATE_HTML = """
 """
 if __name__ == '__main__':
     threading.Thread(target=periodic_live_simulation, daemon=True).start()
-    app.run(debug=True, port=8000)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
