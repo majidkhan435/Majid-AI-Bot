@@ -1,0 +1,5 @@
+.env
+model.pkl
+live_predictions_log.csv
+__pycache__/
+*.pyc
