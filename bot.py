@@ -11,6 +11,7 @@ import io
 import threading
 import time
 import os
+import json
 
 load_dotenv()
 
@@ -27,8 +28,12 @@ stop_loss_multiplier = 1.5
 take_profit_multiplier = 2.5
 confidence_threshold = 0.4  # lowered to allow more trades
 total_portfolio = 100.0
-max_hold_period = 5
-latest_trades = []
+max_hold_period = 5  # in bars (each run counts as one bar for simplicity)
+latest_trades = []  # kept for compatibility but not used for history
+
+# === NEW: Persistence files for rolling PnL and trade history ===
+POSITIONS_FILE = 'positions.json'        # open positions persisted across runs
+HISTORY_FILE = 'trade_history.csv'       # closed trades history (for last 20 trades and rolling PnL)
 
 features = ['rsi', 'ema_fast', 'ema_slow', 'macd', 'stoch_rsi', 'volatility',
             'momentum', 'returns', 'volume_change', 'log_return',
@@ -86,9 +91,47 @@ def simulate_trading_live():
     for symbol in top_symbols:
         try:
             live_prices[symbol] = float(client.get_symbol_ticker(symbol=symbol)['price'])
-        except:
+        except Exception as e:
+            print(f"[WARN] Live price failed for {symbol}: {e}")
             continue
     return live_prices
+
+# =======================
+# NEW: Persistence helpers
+# =======================
+
+def load_positions():
+    if os.path.exists(POSITIONS_FILE):
+        try:
+            with open(POSITIONS_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print('[ERROR] Failed to load positions:', e)
+    return {}
+
+def save_positions(positions):
+    try:
+        with open(POSITIONS_FILE, 'w') as f:
+            json.dump(positions, f)
+    except Exception as e:
+        print('[ERROR] Failed to save positions:', e)
+
+HISTORY_COLUMNS = ['time_open', 'time_close', 'symbol', 'side', 'entry_price', 'exit_price', 'qty', 'pnl', 'confidence', 'hold_bars']
+
+def append_history(row: dict):
+    df = pd.DataFrame([row], columns=HISTORY_COLUMNS)
+    header = not os.path.exists(HISTORY_FILE)
+    df.to_csv(HISTORY_FILE, mode='a', index=False, header=header)
+
+def load_history(n=None):
+    if not os.path.exists(HISTORY_FILE):
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+    df = pd.read_csv(HISTORY_FILE)
+    return df.tail(n) if n else df
+
+# =======================
+# Signals / Model
+# =======================
 
 def simulate_single_trade():
     top_symbols = get_top_symbols()
@@ -113,15 +156,13 @@ def simulate_single_trade():
     y = full_df['target']
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, shuffle=False, test_size=0.2)
-    # Historical CSV skipped: was missing feature columns for self-learning
-    pass
 
     import joblib
     if os.path.exists('model.pkl'):
         try:
             model = joblib.load('model.pkl')
             print("[INFO] Loaded existing model from disk.")
-        except:
+        except Exception:
             model = RandomForestClassifier(n_estimators=100, random_state=42)
             print("[WARNING] Failed to load model, retraining from scratch.")
     else:
@@ -142,28 +183,139 @@ def simulate_single_trade():
 
         if pred == 2 and prob[2] > confidence_threshold:
             action = "BUY"
-            confidence = prob[2]
+            confidence = float(prob[2])
         elif pred == 0 and prob[0] > confidence_threshold:
             action = "SELL"
-            confidence = prob[0]
+            confidence = float(prob[0])
         else:
             action = "HOLD"
-            confidence = 0
+            confidence = 0.0
 
         if action in ["BUY", "SELL"]:
-            allocations[symbol] = prob[2] + prob[0]
+            allocations[symbol] = float(prob[2] + prob[0])
             latest_trades.append({
                 "time": time_stamp,
                 "symbol": symbol,
                 "action": action,
-                "price": price,
+                "price": float(price),
                 "pnl": "-",
-                "confidence": round(confidence, 2),
+                "confidence": round(confidence, 4),
                 "hold": "-"
             })
 
     accuracy = model.score(X_test, y_test)
     return latest_trades, allocations, round(accuracy * 100, 2)
+
+# =======================
+# NEW: Position management & rolling PnL
+# =======================
+
+def process_signals_and_update_history(signals, live_prices):
+    """Open/close positions based on signals; realize PnL on closes; persist history.
+       Returns unrealized_pnl for currently open positions and a dict of open positions.
+    """
+    positions = load_positions()
+
+    # Compute capital allocation weights from signals
+    actionable = [s for s in signals if s['action'] in ('BUY', 'SELL')]
+    conf_sum = sum(s['confidence'] for s in actionable) or 0.0
+
+    # Ensure structure for each existing position
+    for sym, pos in positions.items():
+        pos.setdefault('hold_bars', 0)
+
+    # First, increment hold on existing positions
+    for sym in list(positions.keys()):
+        positions[sym]['hold_bars'] = positions[sym].get('hold_bars', 0) + 1
+
+    # Open/Close logic per signal
+    for s in actionable:
+        sym = s['symbol']
+        signal_side = s['action']  # BUY or SELL
+        entry_price = s['price']
+        confidence = s['confidence']
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        live_price = float(live_prices.get(sym, entry_price))
+
+        # If existing position in opposite direction -> close it
+        if sym in positions and positions[sym]['side'] != signal_side:
+            pos = positions.pop(sym)
+            qty = pos['qty']
+            side = pos['side']
+            open_price = pos['entry_price']
+            hold_bars = pos.get('hold_bars', 0)
+
+            if side == 'BUY':
+                pnl = (live_price - open_price) * qty
+            else:  # side == 'SELL'
+                pnl = (open_price - live_price) * qty
+
+            append_history({
+                'time_open': pos['time_open'],
+                'time_close': now,
+                'symbol': sym,
+                'side': side,
+                'entry_price': round(open_price, 8),
+                'exit_price': round(live_price, 8),
+                'qty': round(qty, 8),
+                'pnl': round(pnl, 8),
+                'confidence': pos.get('confidence', 0.0),
+                'hold_bars': hold_bars,
+            })
+
+        # If no open position after potential close, consider opening new
+        if sym not in positions:
+            weight = (confidence / conf_sum) if conf_sum > 0 else (1.0 / max(len(actionable), 1))
+            capital_allocated = total_portfolio * weight
+            qty = capital_allocated / max(entry_price, 1e-9)
+            positions[sym] = {
+                'side': signal_side,
+                'entry_price': float(entry_price),
+                'qty': float(qty),
+                'time_open': now,
+                'confidence': float(confidence),
+                'hold_bars': 0,
+            }
+
+    # Auto-close positions that exceed max_hold_period
+    for sym in list(positions.keys()):
+        pos = positions[sym]
+        if pos.get('hold_bars', 0) >= max_hold_period:
+            now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            live_price = float(live_prices.get(sym, pos['entry_price']))
+            if pos['side'] == 'BUY':
+                pnl = (live_price - pos['entry_price']) * pos['qty']
+            else:
+                pnl = (pos['entry_price'] - live_price) * pos['qty']
+            append_history({
+                'time_open': pos['time_open'],
+                'time_close': now,
+                'symbol': sym,
+                'side': pos['side'],
+                'entry_price': round(pos['entry_price'], 8),
+                'exit_price': round(live_price, 8),
+                'qty': round(pos['qty'], 8),
+                'pnl': round(pnl, 8),
+                'confidence': pos.get('confidence', 0.0),
+                'hold_bars': pos.get('hold_bars', 0),
+            })
+            positions.pop(sym)
+
+    # Compute unrealized PnL on remaining open positions
+    unrealized = 0.0
+    for sym, pos in positions.items():
+        live_price = float(live_prices.get(sym, pos['entry_price']))
+        if pos['side'] == 'BUY':
+            unrealized += (live_price - pos['entry_price']) * pos['qty']
+        else:
+            unrealized += (pos['entry_price'] - live_price) * pos['qty']
+
+    save_positions(positions)
+    return unrealized, positions
+
+# =======================
+# Routes & dashboard
+# =======================
 
 @app.route('/simulate-live')
 def simulate_live():
@@ -186,7 +338,7 @@ def simulate_live():
     <a href="/">← Back</a>
     """, trades=trades, accuracy=accuracy)
 
-# Background logging job
+# Background logging job (unchanged)
 
 def periodic_live_simulation():
     while True:
@@ -194,7 +346,6 @@ def periodic_live_simulation():
             trades, allocations, accuracy = simulate_single_trade()
             df = pd.DataFrame(trades)
             if not df.empty:
-                # Skipping feature logging due to undefined full_df in background thread
                 df['target'] = [2 if t['action'] == 'BUY' else 0 if t['action'] == 'SELL' else 1 for t in trades]
                 log_file = 'live_predictions_log.csv'
                 df['model_accuracy'] = accuracy
@@ -207,16 +358,15 @@ def periodic_live_simulation():
 
 @app.route('/download-trades')
 def download_trades():
-    df = pd.DataFrame(latest_trades)
+    # Export closed trades history
+    df = load_history()
     csv = df.to_csv(index=False)
     return send_file(
         io.BytesIO(csv.encode()),
         mimetype='text/csv',
         as_attachment=True,
-        download_name='latest_trades.csv'
+        download_name='trade_history.csv'
     )
-
-
 
 @app.route('/toggle-mode', methods=['POST'])
 def toggle_mode():
@@ -228,50 +378,61 @@ def toggle_mode():
 def rerun():
     return redirect(url_for('dashboard'))
 
+# === UPDATED: simulate_trading now does position management & rolling PnL ===
+
 def simulate_trading():
-    trades, allocations, accuracy = simulate_single_trade()
+    signals, allocations, accuracy = simulate_single_trade()
+    live_prices = simulate_trading_live()
 
-    profit = 0.0
-    trade_count = len(trades)
-    confidence_sum = sum([trade['confidence'] for trade in trades if isinstance(trade['confidence'], (int, float))])
-    position_size = total_portfolio  # total available capital
+    # Update/open/close positions and get unrealized PnL
+    unrealized_pnl, open_positions = process_signals_and_update_history(signals, live_prices)
 
-    for trade in trades:
-        symbol = trade['symbol']
-        entry_price = trade['price']
-        try:
-            live_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-            allocation_fraction = trade['confidence'] / confidence_sum if confidence_sum > 0 else 1 / trade_count
-            capital_allocated = position_size * allocation_fraction
-            quantity = capital_allocated / entry_price
+    # Rolling realized PnL from history
+    hist = load_history()
+    realized_profit = float(hist['pnl'].sum()) if not hist.empty else 0.0
 
-            if trade['action'] == 'BUY':
-                pnl = (live_price - entry_price) * quantity
-            elif trade['action'] == 'SELL':
-                pnl = (entry_price - live_price) * quantity
-            else:
-                pnl = 0
+    # Total balance = starting capital + realized + unrealized
+    total_balance = round(total_portfolio + realized_profit + unrealized_pnl, 2)
 
-            trade['pnl'] = round(pnl, 2)
-            profit += pnl
-        except:
-            trade['pnl'] = '-'
-
-    trade_count = len(trades)
+    # For dashboard numbers
+    trade_count = len(open_positions)  # number of open positions
     sharpe = round(np.random.uniform(0.8, 2.5), 2)
     mdd = round(np.random.uniform(5, 25), 2)
     wlr = round(np.random.uniform(0.5, 2.0), 2)
-    total_balance = round(total_portfolio + profit, 2)
 
-    return round(profit, 2), trade_count, sharpe, mdd, wlr, trades, total_balance, allocations, accuracy
+    # Recent trades = last 20 closed trades
+    recent_trades_df = load_history(20)
+    # Map to table fields expected by template
+    trades_for_table = []
+    for _, r in recent_trades_df.iterrows():
+        trades_for_table.append({
+            'time': r.get('time_close', r.get('time_open')),  # show close time
+            'symbol': r['symbol'],
+            'action': r['side'],
+            'price': round(float(r['exit_price']), 6) if not pd.isna(r['exit_price']) else '-',
+            'pnl': round(float(r['pnl']), 4),
+            'confidence': round(float(r['confidence']), 4) if not pd.isna(r['confidence']) else '-',
+            'hold': int(r['hold_bars']) if not pd.isna(r['hold_bars']) else '-',
+        })
+
+    return (round(realized_profit, 2),  # Total Profit ($) = rolling realized PnL
+            trade_count,
+            sharpe,
+            mdd,
+            wlr,
+            trades_for_table,
+            total_balance,
+            allocations,
+            accuracy,
+            live_prices)
 
 @app.route('/')
 def dashboard():
     global trading_mode
-    profit, trade_count, sharpe, mdd, wlr, trades, total_balance, allocations, accuracy = simulate_trading()
+    (profit, trade_count, sharpe, mdd, wlr, trades, total_balance, allocations, accuracy, live_prices) = simulate_trading()
     summary = {
-        'Total Profit ($)': profit,
-        'Trade Count': trade_count,
+        'Total Profit ($)': profit,  # rolling (realized) profit
+        'Trade Count (Open)': trade_count,
         'Sharpe Ratio': sharpe,
         'Max Drawdown (%)': mdd,
         'Win/Loss Ratio': wlr,
@@ -280,14 +441,14 @@ def dashboard():
         'Last Updated': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
 
+    # Keep the old ML Predictions table behavior (allocation ~ buy+sell conf)
     probs = {symbol: [0, 0, allocation] for symbol, allocation in allocations.items()}
-    live_prices = simulate_trading_live()
 
     return render_template_string(
         TEMPLATE_HTML,
         trading_mode=trading_mode,
         summary=summary,
-        trades=trades,
+        trades=trades,                # last 20 closed trades
         allocations=allocations,
         probs=probs,
         confidence_threshold=confidence_threshold,
@@ -320,10 +481,10 @@ TEMPLATE_HTML = """
           {% endfor %}
         </div>
 
-        <h3 class="text-info mt-4">Recent Trades</h3>
+        <h3 class="text-info mt-4">Recent Trades (Last 20 Closed)</h3>
         <table class="table table-bordered table-dark">
           <thead>
-            <tr><th>Time</th><th>Symbol</th><th>Action</th><th>Price</th><th>PnL</th><th>Confidence</th><th>Hold Time</th></tr>
+            <tr><th>Close Time</th><th>Symbol</th><th>Side</th><th>Exit Price</th><th>PnL</th><th>Confidence</th><th>Hold Bars</th></tr>
           </thead>
           <tbody>
             {% for trade in trades %}
@@ -396,6 +557,7 @@ TEMPLATE_HTML = """
 </body>
 </html>
 """
+
 if __name__ == '__main__':
     threading.Thread(target=periodic_live_simulation, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
